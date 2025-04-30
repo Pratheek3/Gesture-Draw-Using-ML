@@ -1,0 +1,285 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+from datetime import datetime
+import os
+import speech_recognition as sr  # Added for speech-to-text
+
+# ====================== Helper Functions ======================
+
+def detect_finger(hand_landmarks):
+    if hand_landmarks:
+        index_finger = hand_landmarks.landmark[8]
+        return (int(index_finger.x * width), int(index_finger.y * height))
+    return None
+
+def detect_gesture(hand_landmarks):
+    if not hand_landmarks:
+        return "none"
+    
+    index_tip = hand_landmarks.landmark[8].y
+    index_pip = hand_landmarks.landmark[6].y
+    middle_tip = hand_landmarks.landmark[12].y
+    middle_pip = hand_landmarks.landmark[10].y
+    ring_tip = hand_landmarks.landmark[16].y
+    pinky_tip = hand_landmarks.landmark[20].y
+    
+    if (index_tip < index_pip and middle_tip > middle_pip and 
+        ring_tip > middle_pip and pinky_tip > middle_pip):
+        return "draw"
+    
+    elif (index_tip < index_pip and middle_tip < middle_pip and 
+          ring_tip > middle_pip and pinky_tip > middle_pip):
+        return "erase"
+    
+    return "none"
+
+def apply_filter(canvas, filter_type):
+    if filter_type == "sketch":
+        gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    return canvas
+
+def draw_with_style(canvas, start_point, end_point, style):
+    if not start_point or not end_point:
+        return
+        
+    if style == "normal":
+        cv2.line(canvas, start_point, end_point, current_color, thickness)
+    
+    elif style == "spray":
+        points = np.random.normal(0, thickness, (20, 2))
+        for point in points:
+            x = int(end_point[0] + point[0])
+            y = int(end_point[1] + point[1])
+            if 0 <= x < width and 0 <= y < height:
+                cv2.circle(canvas, (x, y), 1, current_color, -1)
+    
+    elif style == "rainbow":
+        global hue
+        hue = (hue + 2) % 180
+        rainbow_color = cv2.cvtColor(np.uint8([[[hue, 255, 255]]]), 
+                                   cv2.COLOR_HSV2BGR)[0][0].tolist()
+        cv2.line(canvas, start_point, end_point, rainbow_color, thickness)
+
+def draw_shape(canvas, center, radius):
+    if shape_mode:
+        if current_shape == "circle":
+            cv2.circle(canvas, center, radius, current_color, thickness)
+        elif current_shape == "rectangle":
+            top_left = (center[0] - radius, center[1] - radius)
+            bottom_right = (center[0] + radius, center[1] + radius)
+            cv2.rectangle(canvas, top_left, bottom_right, current_color, thickness)
+        elif current_shape == "triangle":
+            points = np.array([
+                [center[0], center[1] - radius],
+                [center[0] - radius, center[1] + radius],
+                [center[0] + radius, center[1] + radius]
+            ], np.int32)
+            cv2.polylines(canvas, [points], True, current_color, thickness)
+
+def save_canvas():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"drawing_{timestamp}.png"
+    cv2.imwrite(filename, canvas)
+    print(f"Saved as {filename}")
+    return filename
+
+def save_state():
+    canvas_history.append(canvas.copy())
+    if len(canvas_history) > max_history:
+        canvas_history.pop(0)
+
+def undo():
+    if canvas_history:
+        return canvas_history.pop()
+    return None
+
+def recognize_speech():
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("Listening...")
+        try:
+            audio = r.listen(source, timeout=5)
+            print("Recognizing...")
+            return r.recognize_google(audio)
+        except sr.WaitTimeoutError:
+            print("Speech timeout")
+        except sr.UnknownValueError:
+            print("Could not understand audio")
+        except sr.RequestError:
+            print("Speech Recognition API unavailable")
+    return ""
+
+def draw_textbox(frame, text):
+    cv2.rectangle(frame, (0, height - textbox_height), (width, height), (255, 255, 255), -1)
+    cv2.putText(frame, text[-80:], (10, height - 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+# ====================== Initial Setup ======================
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
+mp_draw = mp.solutions.drawing_utils
+
+width, height = 640, 480
+canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
+
+colors = {
+    'black': (0, 0, 0),
+    'red': (0, 0, 255),
+    'green': (0, 255, 0),
+    'blue': (255, 0, 0),
+    'yellow': (0, 255, 255),
+    'eraser': (255, 255, 255)
+}
+current_color = colors['black']
+thickness = 5
+eraser_size = 20
+prev_points = []
+prev_pos = None
+drawing = False
+brush_style = "normal"
+shape_mode = False
+current_shape = "circle"
+canvas_history = []
+max_history = 10
+hue = 0
+
+textbox_height = 60
+annotation_text = ""
+speech_active = False
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+instructions = [
+    "Controls:",
+    "Gestures:",
+    "- Index finger up: Draw",
+    "- Index + Middle up: Erase",
+    "Keys:",
+    "- '1': Normal brush",
+    "- '2': Spray brush",
+    "- '3': Rainbow brush",
+    "- '4': Shape mode",
+    "- 's': Save canvas",
+    "- 'z': Undo",
+    "- 'f': Sketch filter",
+    "- 'x': Clear screen",
+    "- 't': Voice note",
+    "- 'd': Clear note",
+    "- 'q': Quit"
+]
+
+# ====================== Main Loop ======================
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb_frame)
+
+    for i, text in enumerate(instructions):
+        cv2.putText(frame, text, (10, 20 + i * 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2)
+        cv2.putText(frame, text, (10, 20 + i * 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            finger_pos = detect_finger(hand_landmarks)
+            gesture = detect_gesture(hand_landmarks)
+
+            if finger_pos:
+                prev_points.append(finger_pos)
+                if len(prev_points) > 5:
+                    prev_points.pop(0)
+
+                smoothed_pos = (
+                    int(sum(p[0] for p in prev_points) / len(prev_points)),
+                    int(sum(p[1] for p in prev_points) / len(prev_points))
+                )
+
+                if gesture == "draw":
+                    cv2.circle(frame, smoothed_pos, 5, current_color, -1)
+                    if prev_pos:
+                        save_state()
+                        if shape_mode:
+                            radius = int(((smoothed_pos[0] - prev_pos[0])**2 + 
+                                          (smoothed_pos[1] - prev_pos[1])**2) ** 0.5)
+                            draw_shape(canvas, prev_pos, radius)
+                        else:
+                            draw_with_style(canvas, prev_pos, smoothed_pos, brush_style)
+                    prev_pos = smoothed_pos
+
+                elif gesture == "erase":
+                    cv2.circle(frame, smoothed_pos, eraser_size, (0, 255, 0), 2)
+                    if prev_pos:
+                        save_state()
+                        cv2.line(canvas, prev_pos, smoothed_pos, 
+                                 colors['eraser'], eraser_size * 2)
+                    prev_pos = smoothed_pos
+                else:
+                    prev_pos = None
+
+    combined_image = cv2.addWeighted(frame, 0.7, canvas, 0.3, 0)
+    draw_textbox(combined_image, annotation_text)
+    cv2.imshow('Hand Drawing Canvas', combined_image)
+    cv2.imshow('Canvas Only', canvas)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('c'):
+        save_state()
+        canvas.fill(255)
+    elif key == ord('b'):
+        current_color = colors['black']
+    elif key == ord('r'):
+        current_color = colors['red']
+    elif key == ord('g'):
+        current_color = colors['green']
+    elif key == ord('l'):
+        current_color = colors['blue']
+    elif key == ord('y'):
+        current_color = colors['yellow']
+    elif key == ord('+') and thickness < 30:
+        thickness += 1
+    elif key == ord('-') and thickness > 1:
+        thickness -= 1
+    elif key == ord('1'):
+        brush_style = "normal"
+    elif key == ord('2'):
+        brush_style = "spray"
+    elif key == ord('3'):
+        brush_style = "rainbow"
+    elif key == ord('4'):
+        shape_mode = not shape_mode
+    elif key == ord('s'):
+        save_canvas()
+    elif key == ord('z'):
+        restored_canvas = undo()
+        if restored_canvas is not None:
+            canvas = restored_canvas
+    elif key == ord('f'):
+        save_state()
+        canvas = apply_filter(canvas, "sketch")
+    elif key == ord('x'):
+        save_state()
+        canvas = np.ones((height, width, 3), dtype=np.uint8) * 255
+    elif key == ord('t'):
+        speech = recognize_speech()
+        if speech:
+            annotation_text += " " + speech
+    elif key == ord('d'):
+        annotation_text = ""
+
+cap.release()
+cv2.destroyAllWindows()
+hands.close()
